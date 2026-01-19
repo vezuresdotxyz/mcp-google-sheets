@@ -1,0 +1,25 @@
+services:
+  mcp-google-sheets:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mcp-google-sheets:local
+    container_name: mcp-google-sheets
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    environment:
+      # Server configuration
+      - HOST=${HOST:-0.0.0.0}
+      - PORT=${PORT:-8000}
+      - FASTMCP_HOST=${FASTMCP_HOST:-0.0.0.0}
+      - FASTMCP_PORT=${FASTMCP_PORT:-8000}
+      
+      # SSE timeout configuration
+      - SSE_TIMEOUT=${SSE_TIMEOUT:-3600}
+      - SSE_KEEPALIVE_TIMEOUT=${SSE_KEEPALIVE_TIMEOUT:-30}
+      - SSE_INACTIVITY_TIMEOUT=${SSE_INACTIVITY_TIMEOUT:-300}
+      
+

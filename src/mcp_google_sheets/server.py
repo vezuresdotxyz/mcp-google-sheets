@@ -7,6 +7,9 @@ A Model Context Protocol (MCP) server built with FastMCP for interacting with Go
 import base64
 import os
 import sys
+import logging
+import contextvars
+import asyncio
 from typing import List, Dict, Any, Optional, Union
 import json
 from dataclasses import dataclass
@@ -15,6 +18,10 @@ from collections.abc import AsyncIterator
 
 # MCP imports
 from mcp.server.fastmcp import FastMCP, Context
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.requests import Request as StarletteRequest
+from starlette.routing import Mount, Route
 
 # Google API imports
 from google.oauth2.credentials import Credentials
@@ -24,6 +31,14 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 import google.auth
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
 # Constants
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
 CREDENTIALS_CONFIG = os.environ.get('CREDENTIALS_CONFIG')
@@ -31,6 +46,153 @@ TOKEN_PATH = os.environ.get('TOKEN_PATH', 'token.json')
 CREDENTIALS_PATH = os.environ.get('CREDENTIALS_PATH', 'credentials.json')
 SERVICE_ACCOUNT_PATH = os.environ.get('SERVICE_ACCOUNT_PATH', 'service_account.json')
 DRIVE_FOLDER_ID = os.environ.get('DRIVE_FOLDER_ID', '')  # Working directory in Google Drive
+
+# Session timeout configuration (in seconds)
+# Can be overridden via environment variables
+SSE_TIMEOUT = int(os.environ.get('SSE_TIMEOUT', '3600'))  # Default: 1 hour
+SSE_KEEPALIVE_TIMEOUT = int(os.environ.get('SSE_KEEPALIVE_TIMEOUT', '30'))  # Default: 30 seconds
+SSE_INACTIVITY_TIMEOUT = int(os.environ.get('SSE_INACTIVITY_TIMEOUT', '300'))  # Default: 5 minutes
+
+# Context variable to store per-request authorization header
+# Note: contextvars are automatically isolated per async context/task.
+# Each SSE connection runs in its own async context, so multiple concurrent
+# connections will each have their own isolated auth_header value.
+auth_header_var: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar('auth_header', default=None)
+
+# Context variables to store per-session Google API services
+# These are built from the auth header for each SSE session
+sheets_service_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar('sheets_service', default=None)
+drive_service_var: contextvars.ContextVar[Optional[Any]] = contextvars.ContextVar('drive_service', default=None)
+
+def get_auth_header() -> Optional[str]:
+    """
+    Get the authorization header from the current request context.
+    
+    This function retrieves the auth header that was captured when the SSE
+    connection was established. The header is automatically scoped to the
+    current async context, so each concurrent SSE session has its own
+    isolated value.
+    
+    Returns:
+        The authorization header string if present, None otherwise.
+    """
+    return auth_header_var.get()
+
+
+def build_services_from_auth_header(auth_header: str) -> tuple[Any, Any]:
+    """
+    Build Google Sheets and Drive services from an authorization header.
+    
+    The auth header should contain a base64-encoded OAuth2 user credentials JSON.
+    Expected format:
+    {
+        "token": "<access_token>",
+        "refresh_token": "<refresh_token>",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "client_id": "<client_id>",
+        "client_secret": "<client_secret>",
+        "scopes": ["https://www.googleapis.com/auth/spreadsheets", ...]
+    }
+    
+    Format: "Bearer <base64_encoded_json>"
+    
+    Args:
+        auth_header: The authorization header containing base64-encoded OAuth2 credentials JSON
+                    (e.g., "Bearer <base64_encoded_json>")
+    
+    Returns:
+        Tuple of (sheets_service, drive_service)
+    
+    Raises:
+        ValueError: If the auth header format is invalid or decoding fails
+        Exception: If service creation fails
+    """
+    # Extract token from header (supports "Bearer <token>" or just "<token>")
+    if auth_header.startswith("Bearer "):
+        encoded_json = auth_header[7:]  # Remove "Bearer " prefix
+    else:
+        encoded_json = auth_header
+    
+    try:
+        # Decode base64 to get the JSON string
+        decoded_json = base64.b64decode(encoded_json).decode('utf-8')
+    except Exception as e:
+        raise ValueError(f"Failed to decode base64 credentials: {e}")
+    
+    try:
+        # Parse the JSON to get OAuth2 user credentials info
+        oauth_credentials_info = json.loads(decoded_json)
+        logger.info(f"OAuth credentials info: {oauth_credentials_info}")
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Failed to parse credentials JSON: {e}")
+    
+    # Validate required fields
+    required_fields = ['token', 'refresh_token', 'token_uri', 'client_id', 'client_secret']
+    missing_fields = [field for field in required_fields if field not in oauth_credentials_info]
+    if missing_fields:
+        raise ValueError(f"Missing required credential fields: {missing_fields}")
+    
+    try:
+        # Create credentials from the OAuth2 user info
+        # Use scopes from the credentials if provided, otherwise use default SCOPES
+        creds_scopes = oauth_credentials_info.get('scopes', SCOPES)
+        creds = Credentials.from_authorized_user_info(
+            oauth_credentials_info,
+            scopes=creds_scopes
+        )
+        
+        logger.info("Built credentials from base64-encoded OAuth2 credentials JSON")
+    except Exception as e:
+        raise ValueError(f"Failed to create credentials from OAuth2 user info: {e}")
+    
+    # Build the services
+    try:
+        sheets_service = build('sheets', 'v4', credentials=creds)
+        drive_service = build('drive', 'v3', credentials=creds)
+        
+        logger.info("Built Google API services from auth header")
+        return sheets_service, drive_service
+    except Exception as e:
+        raise Exception(f"Failed to build Google API services: {e}")
+
+
+def get_sheets_service(ctx: Optional[Context] = None) -> Any:
+    """
+    Get the sheets service from the current session contextvars.
+    
+    Args:
+        ctx: Optional MCP Context (not used, kept for compatibility)
+    
+    Returns:
+        The sheets service
+    
+    Raises:
+        ValueError: If no service is available
+    """
+    service = sheets_service_var.get()
+    if service is None:
+        raise ValueError("No Google Sheets service available. Please provide an authorization header or configure default credentials.")
+    return service
+
+
+def get_drive_service(ctx: Optional[Context] = None) -> Any:
+    """
+    Get the drive service from the current session contextvars.
+    
+    Args:
+        ctx: Optional MCP Context (not used, kept for compatibility)
+    
+    Returns:
+        The drive service
+    
+    Raises:
+        ValueError: If no service is available
+    """
+    service = drive_service_var.get()
+    if service is None:
+        raise ValueError("No Google Drive service available. Please provide an authorization header or configure default credentials.")
+    return service
+
 
 @dataclass
 class SpreadsheetContext:
@@ -42,91 +204,241 @@ class SpreadsheetContext:
 
 @asynccontextmanager
 async def spreadsheet_lifespan(server: FastMCP) -> AsyncIterator[SpreadsheetContext]:
-    """Manage Google Spreadsheet API connection lifecycle"""
-    # Authenticate and build the service
-    creds = None
+    # """Manage Google Spreadsheet API connection lifecycle"""
+    # # Authenticate and build the service
+    # creds = None
 
-    if CREDENTIALS_CONFIG:
-        creds = service_account.Credentials.from_service_account_info(json.loads(base64.b64decode(CREDENTIALS_CONFIG)), scopes=SCOPES)
+    # if CREDENTIALS_CONFIG:
+    #     creds = service_account.Credentials.from_service_account_info(json.loads(base64.b64decode(CREDENTIALS_CONFIG)), scopes=SCOPES)
     
-    # Check for explicit service account authentication first (custom SERVICE_ACCOUNT_PATH)
-    if not creds and SERVICE_ACCOUNT_PATH and os.path.exists(SERVICE_ACCOUNT_PATH):
-        try:
-            # Regular service account authentication
-            creds = service_account.Credentials.from_service_account_file(
-                SERVICE_ACCOUNT_PATH,
-                scopes=SCOPES
-            )
-            print("Using service account authentication")
-            print(f"Working with Google Drive folder ID: {DRIVE_FOLDER_ID or 'Not specified'}")
-        except Exception as e:
-            print(f"Error using service account authentication: {e}")
-            creds = None
+    # # Check for explicit service account authentication first (custom SERVICE_ACCOUNT_PATH)
+    # if not creds and SERVICE_ACCOUNT_PATH and os.path.exists(SERVICE_ACCOUNT_PATH):
+    #     try:
+    #         # Regular service account authentication
+    #         creds = service_account.Credentials.from_service_account_file(
+    #             SERVICE_ACCOUNT_PATH,
+    #             scopes=SCOPES
+    #         )
+    #         print("Using service account authentication")
+    #         print(f"Working with Google Drive folder ID: {DRIVE_FOLDER_ID or 'Not specified'}")
+    #     except Exception as e:
+    #         print(f"Error using service account authentication: {e}")
+    #         creds = None
     
-    # Fall back to OAuth flow if service account auth failed or not configured
-    if not creds:
-        print("Trying OAuth authentication flow")
-        if os.path.exists(TOKEN_PATH):
-            with open(TOKEN_PATH, 'r') as token:
-                creds = Credentials.from_authorized_user_info(json.load(token), SCOPES)
+    # # Fall back to OAuth flow if service account auth failed or not configured
+    # if not creds:
+    #     print("Trying OAuth authentication flow")
+    #     if os.path.exists(TOKEN_PATH):
+    #         with open(TOKEN_PATH, 'r') as token:
+    #             creds = Credentials.from_authorized_user_info(json.load(token), SCOPES)
                 
-        # If credentials are not valid or don't exist, get new ones
-        if not creds or not creds.valid:
-            if creds and creds.expired and creds.refresh_token:
-                try:
-                    print("Attempting to refresh expired token...")
-                    creds.refresh(Request())
-                    print("Token refreshed successfully")
-                    # Save the refreshed token
-                    with open(TOKEN_PATH, 'w') as token:
-                        token.write(creds.to_json())
-                except Exception as refresh_error:
-                    print(f"Token refresh failed: {refresh_error}")
-                    print("Triggering reauthentication flow...")
-                    creds = None  # Clear creds to trigger OAuth flow below
+    #     # If credentials are not valid or don't exist, get new ones
+    #     if not creds or not creds.valid:
+    #         if creds and creds.expired and creds.refresh_token:
+    #             try:
+    #                 print("Attempting to refresh expired token...")
+    #                 creds.refresh(Request())
+    #                 print("Token refreshed successfully")
+    #                 # Save the refreshed token
+    #                 with open(TOKEN_PATH, 'w') as token:
+    #                     token.write(creds.to_json())
+    #             except Exception as refresh_error:
+    #                 print(f"Token refresh failed: {refresh_error}")
+    #                 print("Triggering reauthentication flow...")
+    #                 creds = None  # Clear creds to trigger OAuth flow below
 
-            # If refresh failed or creds don't exist, run OAuth flow
-            if not creds:
-                try:
-                    flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
-                    creds = flow.run_local_server(port=0)
+    #         # If refresh failed or creds don't exist, run OAuth flow
+    #         if not creds:
+    #             try:
+    #                 flow = InstalledAppFlow.from_client_secrets_file(CREDENTIALS_PATH, SCOPES)
+    #                 creds = flow.run_local_server(port=0)
 
-                    # Save the credentials for the next run
-                    with open(TOKEN_PATH, 'w') as token:
-                        token.write(creds.to_json())
-                    print("Successfully authenticated using OAuth flow")
-                except Exception as e:
-                    print(f"Error with OAuth flow: {e}")
-                    creds = None
+    #                 # Save the credentials for the next run
+    #                 with open(TOKEN_PATH, 'w') as token:
+    #                     token.write(creds.to_json())
+    #                 print("Successfully authenticated using OAuth flow")
+    #             except Exception as e:
+    #                 print(f"Error with OAuth flow: {e}")
+    #                 creds = None
     
-    # Try Application Default Credentials if no creds thus far
-    # This will automatically check GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and metadata service
-    if not creds:
-        try:
-            print("Attempting to use Application Default Credentials (ADC)")
-            print("ADC will check: GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and metadata service")
-            creds, project = google.auth.default(
-                scopes=SCOPES
-            )
-            print(f"Successfully authenticated using ADC for project: {project}")
-        except Exception as e:
-            print(f"Error using Application Default Credentials: {e}")
-            raise Exception("All authentication methods failed. Please configure credentials.")
+    # # Try Application Default Credentials if no creds thus far
+    # # This will automatically check GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and metadata service
+    # if not creds:
+    #     try:
+    #         print("Attempting to use Application Default Credentials (ADC)")
+    #         print("ADC will check: GOOGLE_APPLICATION_CREDENTIALS, gcloud auth, and metadata service")
+    #         creds, project = google.auth.default(
+    #             scopes=SCOPES
+    #         )
+    #         print(f"Successfully authenticated using ADC for project: {project}")
+    #     except Exception as e:
+    #         print(f"Error using Application Default Credentials: {e}")
+    #         raise Exception("All authentication methods failed. Please configure credentials.")
     
     # Build the services
-    sheets_service = build('sheets', 'v4', credentials=creds)
-    drive_service = build('drive', 'v3', credentials=creds)
+    sheets_service =None #build('sheets', 'v4', credentials=creds)
+    drive_service = None #build('drive', 'v3', credentials=creds)
     
     try:
         # Provide the service in the context
         yield SpreadsheetContext(
             sheets_service=sheets_service,
             drive_service=drive_service,
-            folder_id=DRIVE_FOLDER_ID if DRIVE_FOLDER_ID else None
+            folder_id=None
         )
     finally:
         # No explicit cleanup needed for Google APIs
         pass
+
+
+class CustomFastMCP(FastMCP):
+    """Custom FastMCP subclass that captures Authorization headers from GET/SSE requests."""
+    
+    async def run_sse_async(self, mount_path: str = "/") -> None:
+        """Run the server using SSE transport with configurable timeouts."""
+        import uvicorn
+        starlette_app = self.sse_app()
+        
+        config = uvicorn.Config(
+            starlette_app,
+            host=self.settings.host,
+            port=self.settings.port,
+            log_level=self.settings.log_level.lower(),
+            timeout_keep_alive=SSE_KEEPALIVE_TIMEOUT,
+            timeout_graceful_shutdown=30,  # Grace period for shutdown
+        )
+        server = uvicorn.Server(config)
+        logger.info(f"Starting SSE server with keepalive timeout: {SSE_KEEPALIVE_TIMEOUT}s, session timeout: {SSE_TIMEOUT}s")
+        await server.serve()
+    
+    def sse_app(self) -> Starlette:
+        """Return an instance of the SSE server app with header capture."""
+        sse = SseServerTransport(self.settings.message_path)
+        
+        async def handle_sse(request: StarletteRequest) -> None:
+            # IMPORTANT: This handler function runs in its own async task.
+            # Contextvars are task-local and will be automatically cleaned up when this task ends,
+            # even if we don't see the cleanup logs. The cleanup logs are for confirmation only.
+            
+            # Log connection attempt for debugging
+            # Common reasons for multiple GET /sse calls:
+            # 1. MCP client retry logic (if first connection fails)
+            # 2. Client initialization (test connection + actual connection)
+            # 3. Browser/client reconnection attempts
+            # 4. CORS preflight (OPTIONS) followed by actual GET (but OPTIONS wouldn't hit this handler)
+            client_info = f"{request.client.host if request.client else 'unknown'}:{request.client.port if request.client else 'unknown'}"
+            logger.info(f"[CONNECT] ===== Handler function STARTED for client {client_info} =====")
+            logger.info(f"[CONNECT] GET /sse connection attempt - Client: {client_info}, Has Auth: {bool(request.headers.get('authorization') or request.headers.get('Authorization'))}")
+            
+            # Capture Authorization header from GET/SSE request
+            # Each SSE connection runs in its own async context, so the context variable
+            # will be isolated per connection, allowing multiple concurrent sessions.
+            auth_header = request.headers.get("authorization") or request.headers.get("Authorization")
+            if auth_header:
+                # Log partial header for security (first 20 chars + indicator)
+                logger.info(f"[CONNECT] Captured Authorization header from GET/SSE: {auth_header[:20]}...")
+            else:
+                logger.debug("[CONNECT] No Authorization header found in GET/SSE request")
+            
+            # Set up context variables BEFORE entering the SSE connection
+            # This ensures they're available even if connection fails early
+            if auth_header:
+                auth_header_var.set(auth_header)
+                try:
+                    sheets_service, drive_service = build_services_from_auth_header(auth_header)
+                    sheets_service_var.set(sheets_service)
+                    drive_service_var.set(drive_service)
+                    logger.info(f"[SETUP] Built per-session Google API services for client {client_info}")
+                except Exception as e:
+                    logger.error(f"[SETUP] Failed to build services from auth header for client {client_info}: {e}")
+                    sheets_service_var.set(None)
+                    drive_service_var.set(None)
+            else:
+                auth_header_var.set(None)
+                sheets_service_var.set(None)
+                drive_service_var.set(None)
+            
+            # Wrap the entire handler in try-finally to ensure cleanup
+            # This is the outermost level - it should ALWAYS execute when the handler function exits
+            # NOTE: If client disconnects abruptly, the handler might not exit immediately,
+            # but contextvars are task-local and will be cleaned up when the task eventually ends
+            try:
+                logger.info(f"[CONNECT] Establishing SSE connection for client {client_info}...")
+                async with sse.connect_sse(
+                    request.scope,
+                    request.receive,
+                    request._send,  # type: ignore[reportPrivateUsage]
+                ) as streams:
+                    logger.info(f"[CONNECT] SSE connection established for client {client_info}, starting MCP server...")
+                    try:
+                        await self._mcp_server.run(
+                            streams[0],
+                            streams[1],
+                            self._mcp_server.create_initialization_options(),
+                        )
+                        logger.info(f"[CONNECT] MCP server.run() completed normally for client {client_info}")
+                    except asyncio.CancelledError:
+                        logger.info(f"[DISCONNECT] MCP server.run() cancelled for client {client_info} (client disconnected)")
+                        raise
+                    except Exception as run_error:
+                        logger.error(f"[ERROR] Error in MCP server.run() for client {client_info}: {run_error}", exc_info=True)
+                        raise
+            except asyncio.CancelledError:
+                logger.info(f"[DISCONNECT] SSE connection cancelled for client {client_info}")
+                raise
+            except Exception as sse_error:
+                logger.error(f"[ERROR] Error in SSE connection for client {client_info}: {sse_error}", exc_info=True)
+                raise
+            finally:
+                # OUTERMOST finally block - should execute when handler function exits
+                # IMPORTANT: This will execute when:
+                # 1. The connection closes normally
+                # 2. An exception occurs
+                # 3. The handler function returns/exits for any reason
+                # 
+                # If this doesn't execute, it means the handler task is still running
+                # (possibly waiting on a blocking operation). However, contextvars are
+                # task-local and will be automatically cleaned up when the task ends.
+                logger.info(f"[CLEANUP] ===== OUTER FINALLY: Handler function exiting for client {client_info} =====")
+                logger.info(f"[CLEANUP] Cleaning up contextvars for client {client_info}")
+                try:
+                    # Verify what we're clearing
+                    auth_before = auth_header_var.get()
+                    sheets_before = sheets_service_var.get()
+                    drive_before = drive_service_var.get()
+                    
+                    logger.info(f"[CLEANUP] Before cleanup - auth: {auth_before is not None}, sheets: {sheets_before is not None}, drive: {drive_before is not None}")
+                    
+                    auth_header_var.set(None)
+                    sheets_service_var.set(None)
+                    drive_service_var.set(None)
+                    
+                    # Verify they're cleared
+                    auth_after = auth_header_var.get()
+                    sheets_after = sheets_service_var.get()
+                    drive_after = drive_service_var.get()
+                    
+                    logger.info(
+                        f"[CLEANUP] After cleanup - auth: {auth_after is None}, sheets: {sheets_after is None}, drive: {drive_after is None}"
+                    )
+                    logger.info(
+                        f"[CLEANUP] Contextvars cleared for client {client_info} - "
+                        f"auth: {auth_before is not None}->{auth_after is None}, "
+                        f"sheets: {sheets_before is not None}->{sheets_after is None}, "
+                        f"drive: {drive_before is not None}->{drive_after is None}"
+                    )
+                    logger.info(f"[CLEANUP] ===== Cleanup completed for client {client_info} =====")
+                except Exception as cleanup_error:
+                    logger.error(f"[CLEANUP] ERROR during contextvar cleanup for client {client_info}: {cleanup_error}", exc_info=True)
+        
+        # POST message handler remains unchanged (no header capture)
+        return Starlette(
+            debug=self.settings.debug,
+            routes=[
+                Route(self.settings.sse_path, endpoint=handle_sse),
+                Mount(self.settings.message_path, app=sse.handle_post_message),
+            ],
+        )
 
 
 # Initialize the MCP server with lifespan management
@@ -139,11 +451,11 @@ except ValueError:
     _resolved_port = 8000
 
 # Initialize the MCP server with explicit host/port to ensure binding as configured
-mcp = FastMCP("Google Spreadsheet",
-              dependencies=["google-auth", "google-auth-oauthlib", "google-api-python-client"],
-              lifespan=spreadsheet_lifespan,
-              host=_resolved_host,
-              port=_resolved_port)
+mcp = CustomFastMCP("Google Spreadsheet",
+                     dependencies=["google-auth", "google-auth-oauthlib", "google-api-python-client"],
+                     lifespan=spreadsheet_lifespan,
+                     host=_resolved_host,
+                     port=_resolved_port)
 
 
 @mcp.tool()
@@ -167,7 +479,8 @@ def get_sheet_data(spreadsheet_id: str,
     Returns:
         Grid data structure with either full metadata or just values from Google Sheets API, depending on include_grid_data parameter
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    # Get service from contextvars with fallback to lifespan
+    sheets_service = get_sheets_service(ctx)
 
     # Construct the range - keep original API behavior
     if range:
@@ -216,7 +529,7 @@ def get_sheet_formulas(spreadsheet_id: str,
     Returns:
         A 2D array of the sheet formulas.
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Construct the range
     if range:
@@ -253,7 +566,7 @@ def update_cells(spreadsheet_id: str,
     Returns:
         Result of the update operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Construct the range
     full_range = f"{sheet}!{range}"
@@ -291,7 +604,7 @@ def batch_update_cells(spreadsheet_id: str,
     Returns:
         Result of the batch update operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Prepare the batch update request
     data = []
@@ -334,7 +647,7 @@ def add_rows(spreadsheet_id: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Get sheet ID
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -392,7 +705,7 @@ def add_columns(spreadsheet_id: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Get sheet ID
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -443,7 +756,7 @@ def list_sheets(spreadsheet_id: str, ctx: Context = None) -> List[str]:
     Returns:
         List of sheet names
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Get spreadsheet metadata
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -472,7 +785,7 @@ def copy_sheet(src_spreadsheet: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Get source sheet ID
     src = sheets_service.spreadsheets().get(spreadsheetId=src_spreadsheet).execute()
@@ -544,7 +857,7 @@ def rename_sheet(spreadsheet: str,
     Returns:
         Result of the operation
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Get sheet ID
     spreadsheet_data = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet).execute()
@@ -598,7 +911,7 @@ def get_multiple_sheet_data(queries: List[Dict[str, str]],
         A list of dictionaries, each containing the original query parameters 
         and the fetched 'data' or an 'error'.
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     results = []
     
     for query in queries:
@@ -646,7 +959,7 @@ def get_multiple_spreadsheet_summary(spreadsheet_ids: List[str],
         A list of dictionaries, each representing a spreadsheet summary. 
         Includes spreadsheet title, sheet summaries (title, headers, first rows), or an error.
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     summaries = []
     
     for spreadsheet_id in spreadsheet_ids:
@@ -730,9 +1043,8 @@ def get_spreadsheet_info(spreadsheet_id: str) -> str:
     Returns:
         JSON string with spreadsheet information
     """
-    # Access the context through mcp.get_lifespan_context() for resources
-    context = mcp.get_lifespan_context()
-    sheets_service = context.sheets_service
+    # Get service from contextvars
+    sheets_service = get_sheets_service()
     
     # Get spreadsheet metadata
     spreadsheet = sheets_service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
@@ -766,9 +1078,9 @@ def create_spreadsheet(title: str, folder_id: Optional[str] = None, ctx: Context
     Returns:
         Information about the newly created spreadsheet including its ID
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
-    # Use provided folder_id or fall back to configured default
-    target_folder_id = folder_id or ctx.request_context.lifespan_context.folder_id
+    drive_service = get_drive_service(ctx)
+    # Use provided folder_id (no fallback to lifespan context)
+    target_folder_id = folder_id
 
     # Create the spreadsheet
     file_body = {
@@ -810,7 +1122,7 @@ def create_sheet(spreadsheet_id: str,
     Returns:
         Information about the newly created sheet
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Define the add sheet request
     request_body = {
@@ -855,9 +1167,11 @@ def list_spreadsheets(folder_id: Optional[str] = None, ctx: Context = None) -> L
     Returns:
         List of spreadsheets with their ID and title
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
-    # Use provided folder_id or fall back to configured default
-    target_folder_id = folder_id or ctx.request_context.lifespan_context.folder_id
+    # Get service from contextvars
+    drive_service = get_drive_service(ctx)
+    
+    # Use provided folder_id (no fallback to lifespan context)
+    target_folder_id = folder_id
     
     query = "mimeType='application/vnd.google-apps.spreadsheet'"
     
@@ -905,7 +1219,7 @@ def share_spreadsheet(spreadsheet_id: str,
         A dictionary containing lists of 'successes' and 'failures'. 
         Each item in the lists includes the email address and the outcome.
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
+    drive_service = get_drive_service(ctx)
     successes = []
     failures = []
     
@@ -975,7 +1289,7 @@ def list_folders(parent_folder_id: Optional[str] = None, ctx: Context = None) ->
     Returns:
         List of folders with their ID, name, and parent information
     """
-    drive_service = ctx.request_context.lifespan_context.drive_service
+    drive_service = get_drive_service(ctx)
     
     query = "mimeType='application/vnd.google-apps.folder'"
     
@@ -1067,7 +1381,7 @@ def batch_update(spreadsheet_id: str,
     Returns:
         Result of the batch update operation, including replies for each request
     """
-    sheets_service = ctx.request_context.lifespan_context.sheets_service
+    sheets_service = get_sheets_service(ctx)
     
     # Validate input
     if not requests:
