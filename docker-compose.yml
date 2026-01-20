@@ -9,13 +9,13 @@ services:
     tty: true
     restart: unless-stopped
     ports:
-      - "${PORT:-8000}:${PORT:-8000}"
+      - "${PORT:-8001}:${PORT:-8001}"
     environment:
       # Server configuration
       - HOST=${HOST:-0.0.0.0}
-      - PORT=${PORT:-8000}
+      - PORT=${PORT:-8001}
       - FASTMCP_HOST=${FASTMCP_HOST:-0.0.0.0}
-      - FASTMCP_PORT=${FASTMCP_PORT:-8000}
+      - FASTMCP_PORT=${FASTMCP_PORT:-8001}
       
       # SSE timeout configuration
       - SSE_TIMEOUT=${SSE_TIMEOUT:-3600}
